@@ -1,0 +1,105 @@
+# 初值拟合：先用 Tobit-only 模型初始化 beta 和 sigma
+  neg_tobit_loglik <- function(par) {
+    beta <- par[seq_len(k)]
+    log_sigma <- par[k + 1]
+    sigma <- exp(log_sigma)
+    if (!is.finite(sigma) || sigma < sigma_min) return(1e10)
+
+    eta <- as.vector(X %*% beta)
+    log_pdf <- dnorm(xx, eta, sigma, log = TRUE)
+    log_cdf <- pnorm(cutoff, eta, sigma, log.p = TRUE)
+    log_tobit <- ifelse(c_ind == 1L, log_cdf, log_pdf)
+    -sum(log_tobit)
+  }
+
+  start_par <- c(rep(0, k), log(max(1, sigma_min)))
+  start_par[disease_coef_index] <- -1
+
+  init <- optim(
+    start_par,
+    neg_tobit_loglik,
+    method = "Nelder-Mead",
+    control = optim_control
+  )
+
+  par <- c(init$par[seq_len(k)], init$par[k + 1], s = s0)
+
+  # EM 迭代
+  update_z <- function(par) {
+    beta <- par[seq_len(k)]
+    log_sigma <- par[k + 1]
+    s <- par[k + 2]
+    if (!check_bounds(log_sigma, s)) return(rep(0, n))
+
+    sigma <- exp(log_sigma)
+    w <- plogis(s)
+    lambda <- as.vector(X %*% beta)
+    cdf <- pnorm(cutoff, lambda, sigma)
+    ifelse(c_ind == 1L, w / (w + (1 - w) * cdf + 1e-12), 0)
+  }
+
+  neg_complete_loglik <- function(par, z) {
+    beta <- par[seq_len(k)]
+    log_sigma <- par[k + 1]
+    s <- par[k + 2]
+    if (!check_bounds(log_sigma, s)) return(1e10)
+
+    sigma <- exp(log_sigma)
+    w <- plogis(s)
+    lambda <- as.vector(X %*% beta)
+    log_pdf <- dnorm(xx, lambda, sigma, log = TRUE)
+    log_cdf <- pnorm(cutoff, lambda, sigma, log.p = TRUE)
+    log_tobit <- ifelse(c_ind == 1L, log_cdf, log_pdf)
+
+    -sum(
+      z * log(w + 1e-12) +
+        (1 - z) * (log(1 - w + 1e-12) + log_tobit)
+    )
+  }
+
+  EM_Tobit <- function() {
+    z <- update_z(par)
+    fit <- optim(
+      par,
+      neg_complete_loglik,
+      z = z,
+      method = "Nelder-Mead",
+      control = optim_control
+    )
+
+    par_curr <- fit$par
+    old_val <- fit$value
+
+    for (iter in seq_len(t_max)) {
+      z <- update_z(par_curr)
+      fit <- optim(
+        par_curr,
+        neg_complete_loglik,
+        z = z,
+        method = "Nelder-Mead",
+        control = optim_control
+      )
+
+      if (!is.finite(fit$value)) break
+
+      rel_diff <- abs(fit$value - old_val) / (abs(old_val) + 1e-8)
+      par_curr <- fit$par
+
+      if (rel_diff < eps_tol) break
+      old_val <- fit$value
+    }
+
+    list(
+      par = par_curr,
+      convergence = fit$convergence
+    )
+  }
+
+  em <- EM_Tobit()
+  par_hat <- em$par
+
+  beta_y <- par_hat[disease_coef_index]
+  se_y <- se_vec[disease_coef_index]
+  df_t <- max(n - length(par_hat), 1)
+  test_stat <- beta_y / se_y
+  p_value <- 2 * (1 - pt(abs(test_stat), df = df_t))
