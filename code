@@ -1,105 +1,194 @@
-# 初值拟合：先用 Tobit-only 模型初始化 beta 和 sigma
+#EMixT for one taxon
+
+fit_one_otu <- function(
+    x, N, Z, u, u1,
+    d = 1L,
+    t_max = 10000,
+    eps_tol = 1e-6,
+    s0 = NULL,
+    hess_eps = 1e-6,
+    small_sample_correction = TRUE,
+    sigma_min = 0.05,
+    w_min = 0.10,
+    w_max = 0.90
+) {
+  
+  n <- length(x)
+  xx <- ifelse(x > 0, log(x / N), log(d / N))
+  cutoff <- log(d / N)
+  c_ind <- as.integer(x == 0)
+
+  if (is.null(s0)) {
+    p0 <- mean(c_ind == 1L, na.rm = TRUE)
+    p0 <- min(max(p0, w_min), w_max)
+    s0 <- qlogis(p0)
+  } else {
+    s0 <- min(max(s0, qlogis(w_min)), qlogis(w_max))
+  }
+  
+  X <- cbind(1, u, u1)
+  k <- ncol(X)
+  disease_coef_index <- 2
+  
+  check_bounds <- function(log_sigma, s) {
+    sigma <- exp(log_sigma)
+    w <- plogis(s)
+    sigma >= sigma_min && w >= w_min && w <= w_max
+  }
+
   neg_tobit_loglik <- function(par) {
     beta <- par[seq_len(k)]
     log_sigma <- par[k + 1]
     sigma <- exp(log_sigma)
+    
     if (!is.finite(sigma) || sigma < sigma_min) return(1e10)
-
+    
     eta <- as.vector(X %*% beta)
     log_pdf <- dnorm(xx, eta, sigma, log = TRUE)
     log_cdf <- pnorm(cutoff, eta, sigma, log.p = TRUE)
     log_tobit <- ifelse(c_ind == 1L, log_cdf, log_pdf)
+    
     -sum(log_tobit)
   }
-
+  
   start_par <- c(rep(0, k), log(max(1, sigma_min)))
   start_par[disease_coef_index] <- -1
-
+  
   init <- optim(
     start_par,
     neg_tobit_loglik,
     method = "Nelder-Mead",
-    control = optim_control
+    control = list(maxit = 100000, reltol = 1e-6, abstol = 1e-6)
   )
-
+  
   par <- c(init$par[seq_len(k)], init$par[k + 1], s = s0)
-
-  # EM 迭代
+  
   update_z <- function(par) {
     beta <- par[seq_len(k)]
     log_sigma <- par[k + 1]
     s <- par[k + 2]
+    
     if (!check_bounds(log_sigma, s)) return(rep(0, n))
-
+    
     sigma <- exp(log_sigma)
     w <- plogis(s)
     lambda <- as.vector(X %*% beta)
     cdf <- pnorm(cutoff, lambda, sigma)
+    
     ifelse(c_ind == 1L, w / (w + (1 - w) * cdf + 1e-12), 0)
   }
-
+  
   neg_complete_loglik <- function(par, z) {
     beta <- par[seq_len(k)]
     log_sigma <- par[k + 1]
     s <- par[k + 2]
+    
     if (!check_bounds(log_sigma, s)) return(1e10)
-
+    
     sigma <- exp(log_sigma)
     w <- plogis(s)
     lambda <- as.vector(X %*% beta)
     log_pdf <- dnorm(xx, lambda, sigma, log = TRUE)
     log_cdf <- pnorm(cutoff, lambda, sigma, log.p = TRUE)
     log_tobit <- ifelse(c_ind == 1L, log_cdf, log_pdf)
-
+    
     -sum(
       z * log(w + 1e-12) +
         (1 - z) * (log(1 - w + 1e-12) + log_tobit)
     )
   }
-
+  
   EM_Tobit <- function() {
     z <- update_z(par)
+    
     fit <- optim(
       par,
       neg_complete_loglik,
       z = z,
       method = "Nelder-Mead",
-      control = optim_control
+      control = list(maxit = 100000, reltol = 1e-6, abstol = 1e-6)
     )
-
+    
     par_curr <- fit$par
     old_val <- fit$value
-
+    
     for (iter in seq_len(t_max)) {
       z <- update_z(par_curr)
+      
       fit <- optim(
         par_curr,
         neg_complete_loglik,
         z = z,
         method = "Nelder-Mead",
-        control = optim_control
+        control = list(maxit = 100000, reltol = 1e-6, abstol = 1e-6)
       )
-
+      
       if (!is.finite(fit$value)) break
-
+      
       rel_diff <- abs(fit$value - old_val) / (abs(old_val) + 1e-8)
       par_curr <- fit$par
-
+      
       if (rel_diff < eps_tol) break
       old_val <- fit$value
     }
-
-    list(
-      par = par_curr,
-      convergence = fit$convergence
-    )
+    
+    list(par = par_curr)
   }
-
+  
   em <- EM_Tobit()
   par_hat <- em$par
-
+  
+  marginal_loglik_vec <- function(par) {
+    beta <- par[seq_len(k)]
+    log_sigma <- par[k + 1]
+    s <- par[k + 2]
+    
+    if (!check_bounds(log_sigma, s)) return(rep(log(1e-12), n))
+    
+    sigma <- exp(log_sigma)
+    w <- plogis(s)
+    lambda <- as.vector(X %*% beta)
+    pdf <- dnorm(xx, lambda, sigma)
+    cdf <- pnorm(cutoff, lambda, sigma)
+    
+    log(pmax(
+      ifelse(c_ind == 1L, w + (1 - w) * cdf, (1 - w) * pdf),
+      1e-12
+    ))
+  }
+  
+  H <- numDeriv::hessian(
+    function(par) -sum(marginal_loglik_vec(par)),
+    par_hat
+  )
+  
+  H <- H + hess_eps * diag(nrow(H))
+  H_inv <- tryCatch(
+    solve(H),
+    error = function(e) MASS::ginv(H)
+  )
+  
+  score_mat <- sapply(seq_len(n), function(i) {
+    numDeriv::grad(function(pp) marginal_loglik_vec(pp)[i], par_hat)
+  })
+  
+  cov_sandwich <- H_inv %*% (score_mat %*% t(score_mat)) %*% H_inv
+  se_vec <- sqrt(pmax(diag(cov_sandwich), 0))
+  
+  if (small_sample_correction) {
+    se_vec <- se_vec * sqrt(n / max(n - length(par_hat), 1))
+  }
+  
   beta_y <- par_hat[disease_coef_index]
   se_y <- se_vec[disease_coef_index]
   df_t <- max(n - length(par_hat), 1)
   test_stat <- beta_y / se_y
   p_value <- 2 * (1 - pt(abs(test_stat), df = df_t))
+  
+  list(
+    beta = beta_y,
+    se_sandwich = se_vec[disease_coef_index],
+    se_adj = se_y,
+    pval = p_value
+  )
+}
