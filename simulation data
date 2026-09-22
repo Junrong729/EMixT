@@ -1,1 +1,683 @@
+#Simulation 1
+
+simulate_otu_mixture_tobit_abs <- function(
+    n1 = 50, n2 = 50,
+    p = 500,
+    nonnull = 150,
+    seed = 1,
+
+    N_min = 25000,
+    N_max = 40000,
+
+    nu0_mean = -5,
+    nu0_sd = 1.0,
+
+    sigma_mean = 1.0,
+    sigma_sd = 0.2,
+
+    alpha1_mean = 1.0,
+    alpha1_sd = 0.2,
+    random_sign = TRUE,
+
+    eta0_mean = -1.0,
+    eta0_sd = 0.7,
+
+    add_cov = TRUE,
+    z_rho = 0.5,
+    z_sd = 1.0,
+    prop_z_taxa = 0.1,
+    gamma_mean = 0.3,
+    gamma_sd = 0.0,
+
+    count_model = "nb",
+    nb_size = 10,
+    depth_scale = 1,
+
+    lod_mode = "fixed",
+    d_fixed = 1L,
+    lod_min = 1L,
+    lod_max = 2000L,
+
+    target_zero = NULL,
+    zero_tol = 0.01,
+    calib_maxit = 25,
+    calib_reps = 3
+){
+
+    set.seed(seed)
+
+    expit <- function(x) 1 / (1 + exp(-x))
+    clamp_pos <- function(x, eps = 1e-6) pmax(x, eps)
+
+    apply_lod_censoring <- function(C_true){
+        d_used <- as.integer(min(max(d_fixed, lod_min), lod_max))
+        C_obs <- C_true
+        mask <- (C_true > 0) & (C_true <= d_used)
+        C_obs[mask] <- 0L
+
+        censor_rate <- sum(mask) / max(sum(C_true > 0), 1)
+
+        list(
+            C_obs = C_obs,
+            d_used = d_used,
+            censor_rate = censor_rate
+        )
+    }
+
+    one_draw <- function(eta0_mean_curr, seed_offset = 0L){
+
+        set.seed(seed + seed_offset)
+
+        n <- n1 + n2
+        group <- c(rep(0, n1), rep(1, n2))
+
+        Z <- rep(0, n)
+
+        if(add_cov){
+
+            a <- z_rho * z_sd / sqrt(max(1e-6, 1 - z_rho^2))
+
+            Z <- a * (group - mean(group)) +
+                rnorm(n, mean = 0, sd = z_sd)
+
+            Z <- as.numeric(scale(Z))
+        }
+
+        N_i <- sample(N_min:N_max, n, replace = TRUE)
+
+        nu0_j <- rnorm(p, nu0_mean, nu0_sd)
+
+        sigma_j <- clamp_pos(
+            rnorm(p, sigma_mean, sigma_sd),
+            eps = 0.05
+        )
+
+        alpha1_j <- rep(0, p)
+
+        idx_signal <- seq_len(min(nonnull, p))
+
+        alpha_raw <- rnorm(
+            length(idx_signal),
+            alpha1_mean,
+            alpha1_sd
+        )
+
+        if(random_sign){
+            alpha_raw <- alpha_raw *
+                sample(c(-1, 1),
+                       length(idx_signal),
+                       replace = TRUE)
+        }
+
+        alpha1_j[idx_signal] <- alpha_raw
+
+        eta0_j <- rnorm(
+            p,
+            eta0_mean_curr,
+            eta0_sd
+        )
+
+        gamma_j <- rep(0, p)
+
+        if(add_cov && prop_z_taxa > 0){
+
+            m <- max(1, floor(prop_z_taxa * p))
+
+            idx_z <- sample(
+                seq_len(p),
+                m,
+                replace = FALSE
+            )
+
+            gamma_j[idx_z] <- rnorm(
+                m,
+                gamma_mean,
+                gamma_sd
+            )
+
+        } else {
+            idx_z <- integer(0)
+        }
+
+
+        C_true <- matrix(
+            0L,
+            nrow = n,
+            ncol = p
+        )
+
+        Z_struct <- matrix(
+            0L,
+            nrow = n,
+            ncol = p
+        )
+
+        X_latent <- matrix(
+            0,
+            nrow = n,
+            ncol = p
+        )
+
+        Y_latent <- matrix(
+            NA_real_,
+            nrow = n,
+            ncol = p
+        )
+
+
+        for(i in seq_len(n)){
+
+            gi <- group[i]
+            Zi <- Z[i]
+
+            w_ij <- expit(eta0_j)
+
+            z_ij <- rbinom(
+                p,
+                1,
+                w_ij
+            )
+
+            Z_struct[i,] <- z_ij
+
+
+            nu_ij <- nu0_j +
+                alpha1_j * gi +
+                gamma_j * Zi
+
+
+            y <- rnorm(
+                p,
+                nu_ij,
+                sigma_j
+            )
+
+            x <- exp(y)
+
+            x[z_ij == 1] <- 0
+
+
+            X_latent[i,] <- x
+            Y_latent[i,] <- y
+
+
+            mu <- N_i[i] *
+                depth_scale *
+                x
+
+
+            Ci <- rnbinom(
+                p,
+                mu = mu,
+                size = nb_size
+            )
+
+            C_true[i,] <- as.integer(Ci)
+
+        }
+
+
+        lod_res <- apply_lod_censoring(C_true)
+
+        C_obs <- lod_res$C_obs
+
+
+        taxa_names <- paste0("Taxon_", seq_len(p))
+        samp_names <- paste0("S", seq_len(n))
+
+        colnames(C_obs) <- taxa_names
+        rownames(C_obs) <- samp_names
+
+        colnames(C_true) <- taxa_names
+        rownames(C_true) <- samp_names
+
+        colnames(X_latent) <- taxa_names
+        rownames(X_latent) <- samp_names
+
+        colnames(Y_latent) <- taxa_names
+        rownames(Y_latent) <- samp_names
+
+
+        meta <- data.frame(
+            sample = samp_names,
+            group = group,
+            N_design = N_i,
+            N_true = rowSums(C_true),
+            N_obs = rowSums(C_obs),
+            Z = Z
+        )
+
+
+        params <- list(
+            seed = seed + seed_offset,
+            idx_signal = idx_signal,
+            truth_is_nonnull =
+                c(rep(TRUE, length(idx_signal)),
+                  rep(FALSE, p-length(idx_signal))),
+            idx_z = idx_z,
+            lod_d_used = lod_res$d_used,
+            lod_censor_rate_observed =
+                lod_res$censor_rate,
+            observed_zero_rate =
+                mean(C_obs == 0)
+        )
+
+
+        list(
+            C_obs = C_obs,
+            C_true = C_true,
+            X_latent = X_latent,
+            Y_latent = Y_latent,
+            Z_struct = Z_struct,
+            meta = meta,
+            params = params
+        )
+    }
+
+
+    if(!is.null(target_zero)){
+
+        lo <- -10
+        hi <- 5
+        eta_mid <- eta0_mean
+
+        eval_zero <- function(eta){
+
+            mean(replicate(
+                calib_reps,
+                one_draw(
+                    eta,
+                    sample.int(100000,1)
+                )$params$observed_zero_rate
+            ))
+        }
+
+
+        for(i in seq_len(calib_maxit)){
+
+            eta_mid <- (lo + hi) / 2
+
+            zhat <- eval_zero(eta_mid)
+
+            if(abs(zhat-target_zero)<=zero_tol)
+                break
+
+            if(zhat < target_zero)
+                lo <- eta_mid
+            else
+                hi <- eta_mid
+        }
+
+        eta0_mean <- eta_mid
+    }
+
+
+    one_draw(
+        eta0_mean,
+        0L
+    )
+}
+
+
+
+simulate_func <- function(...){
+
+    out <- simulate_otu_mixture_tobit_abs(...)
+
+    counts <- out$C_obs
+    storage.mode(counts) <- "integer"
+
+    group <- factor(
+        ifelse(out$meta$group == 1,
+               "group2",
+               "group1"),
+        levels = c("group1","group2")
+    )
+
+    N <- as.integer(out$meta$N_design)
+
+    Z <- out$meta$Z
+
+    list(
+        C = NA,
+        counts = counts,
+        group = group,
+        Z = Z,
+        N = N,
+        truth_is_nonnull =
+            out$params$truth_is_nonnull,
+
+        otu_data = counts,
+
+        meta_data =
+            data.frame(
+                Group = group,
+                Z = Z,
+                N = N
+            ),
+
+        lod_d_used =
+            out$params$lod_d_used,
+
+        lod_censor_rate_observed =
+            out$params$lod_censor_rate_observed,
+
+        observed_zero_rate =
+            out$params$observed_zero_rate
+    )
+}
+
+#Simulation 2
+
+simulate_func <- function(
+    C = 2000,
+    n1 = 50,
+    n2 = 50,
+    p = 500,
+    nonnull = 150,
+
+    N_min = 25000,
+    N_max = 40000,
+
+    seed = 1,
+
+    add_cov = TRUE,
+    z_rho = 0.5,
+    z_sd = 1,
+    prop_z_taxa = 0.1,
+    beta_z = 0.3,
+    random_sign = TRUE,
+
+    add_structural_zero = TRUE,
+    structural_zero_rate = 0.1,
+
+    add_censor = TRUE,
+    censor_threshold = 1,
+    censor_inclusive = TRUE,
+
+    target_zero = NULL,
+    zero_tol = 0.01,
+    calib_maxit = 25,
+    calib_reps = 3
+){
+
+    set.seed(seed)
+
+    softmax <- function(x){
+        x <- x - max(x)
+        exp(x) / sum(exp(x))
+    }
+
+    rdirichlet_1 <- function(alpha){
+        g <- rgamma(length(alpha), shape = alpha, rate = 1)
+        g / sum(g)
+    }
+
+
+    generate_once <- function(sz_rate){
+
+        n <- n1+n2
+
+        N <- sample(
+            N_min:N_max,
+            size=n,
+            replace=TRUE
+        )
+
+        group <- factor(
+            c(rep("group1",n1),rep("group2",n2)),
+            levels=c("group1","group2")
+        )
+
+        G_num <- as.numeric(group=="group2")
+
+
+        if(add_cov){
+
+            a <- z_rho*z_sd/
+                sqrt(max(1e-6,1-z_rho^2))
+
+            Z <- a*(G_num-mean(G_num))+
+                rnorm(n,0,z_sd)
+
+            Z <- as.numeric(scale(Z))
+
+        } else {
+
+            Z <- rep(0,n)
+
+        }
+
+
+        idx_nonnull <- seq_len(nonnull)
+        idx_null <- (nonnull+1):p
+
+
+        prop_signal <- nonnull/p
+
+        p1 <- numeric(p)
+        tmp <- runif(p)
+
+        p1[idx_nonnull] <-
+            tmp[idx_nonnull]/
+            sum(tmp[idx_nonnull])*prop_signal
+
+        p1[idx_null] <-
+            tmp[idx_null]/
+            sum(tmp[idx_null])*(1-prop_signal)
+
+
+        p2 <- p1
+
+        tmp <- runif(nonnull)
+
+        p2[idx_nonnull] <-
+            tmp/sum(tmp)*prop_signal
+
+
+        b <- numeric(p)
+
+        if(add_cov){
+
+            k <- max(1,floor(prop_z_taxa*p))
+
+            idx_aff <- sample.int(
+                p,k,
+                replace=FALSE
+            )
+
+            sign <- if(random_sign)
+                sample(c(-1,1),k,replace=TRUE)
+            else
+                rep(1,k)
+
+            b[idx_aff] <- sign*beta_z
+
+        } else {
+
+            idx_aff <- integer(0)
+
+        }
+
+
+        PI <- matrix(0,n,p)
+
+        for(i in seq_len(n)){
+
+            pg <- if(group[i]=="group1") p1 else p2
+
+            PI[i,] <- softmax(
+                log(pg+1e-12)+b*Z[i]
+            )
+
+        }
+
+
+        structural_zero_indicator <-
+            matrix(
+                FALSE,
+                n,p
+            )
+
+        if(add_structural_zero){
+
+            structural_zero_indicator <-
+                matrix(
+                    rbinom(
+                        n*p,
+                        1,
+                        sz_rate
+                    )==1,
+                    nrow=n,
+                    ncol=p
+                )
+
+        }
+
+
+        counts_true <- matrix(
+            0L,
+            n,p
+        )
+
+
+        for(i in seq_len(n)){
+
+            keep <- which(!structural_zero_indicator[i,])
+
+            if(length(keep)==0)
+                next
+
+            pi <- PI[i,keep]
+            pi <- pi/sum(pi)
+
+            counts_true[i,keep] <-
+                rmultinom(
+                    1,
+                    size=N[i],
+                    prob=rdirichlet_1(C*pi)
+                )
+
+        }
+
+
+        counts_obs <- counts_true
+
+        censored_indicator <-
+            matrix(FALSE,n,p)
+
+
+        if(add_censor){
+
+            if(censor_inclusive){
+
+                censored_indicator <-
+                    (!structural_zero_indicator) &
+                    counts_true>0 &
+                    counts_true<=censor_threshold
+
+            }else{
+
+                censored_indicator <-
+                    (!structural_zero_indicator) &
+                    counts_true>0 &
+                    counts_true<censor_threshold
+
+            }
+
+            counts_obs[censored_indicator] <- 0L
+
+        }
+
+
+        list(
+            counts=counts_obs,
+            counts_true=counts_true,
+            group=group,
+            Z=Z,
+            N=N,
+            structural_zero_indicator=
+                structural_zero_indicator,
+            censored_indicator=
+                censored_indicator,
+            zero_rate_obs=
+                mean(counts_obs==0)
+        )
+
+    }
+
+
+    if(!is.null(target_zero)){
+
+        lo <- 0
+        hi <- 0.95
+
+        for(i in seq_len(calib_maxit)){
+
+            mid <- (lo+hi)/2
+
+            zr <- mean(replicate(
+                calib_reps,
+                generate_once(mid)$zero_rate_obs
+            ))
+
+            if(abs(zr-target_zero)<=zero_tol)
+                break
+
+            if(zr < target_zero)
+                lo <- mid
+            else
+                hi <- mid
+
+        }
+
+        structural_zero_rate <- mid
+
+        set.seed(seed)
+
+    }
+
+
+    out <- generate_once(structural_zero_rate)
+
+
+    truth_is_nonnull <-
+        c(rep(TRUE,nonnull),
+          rep(FALSE,p-nonnull))
+
+
+    otu_data <- out$counts
+
+    meta_data <- data.frame(
+        Group=out$group,
+        Z=out$Z
+    )
+
+
+    list(
+        C=C,
+        otu_data=otu_data,
+        meta_data=meta_data,
+
+        counts=out$counts,
+        counts_true=out$counts_true,
+
+        group=out$group,
+        Z=out$Z,
+        N=out$N,
+
+        truth_is_nonnull=
+            truth_is_nonnull,
+
+        structural_zero_indicator=
+            out$structural_zero_indicator,
+
+        censored_indicator=
+            out$censored_indicator,
+
+        zero_rate_obs=
+            out$zero_rate_obs
+    )
+}
+
 
